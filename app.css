@@ -234,3 +234,63 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
   .bubble .jp{font-size:18px}
 }
 @media (max-width:520px){ .krow{grid-template-columns:42px repeat(5,1fr);gap:5px} .krow.y3{grid-template-columns:42px repeat(3,1fr)} .ktable{gap:5px} .khead{font-size:13px} }
+
+/* ---------- v2: каллиграф, кандзи, «Кот, объясни» ---------- */
+.calli{display:none;margin-right:8px;padding:2px 9px;border-radius:999px;border:1px solid var(--pink);color:var(--pink);font-size:13px;white-space:nowrap}
+.calli.on{display:inline-block}
+.plevel{display:flex;align-items:center;justify-content:flex-end}
+.romaji.meaning{font-size:38px;font-weight:700;letter-spacing:0}
+.phint .jp{font-size:18px;color:var(--text)}
+.cat-offer{display:flex;align-items:center;gap:12px;margin:12px auto 0;padding:8px 16px 8px 8px;border-radius:18px;background:#f3e8d3;color:#2a1d1e;text-align:left;font-size:16px;max-width:420px;box-shadow:0 8px 24px rgba(0,0,0,.35);animation:rise .3s}
+.cat-offer img{width:64px;flex:none}
+.cat-offer b{display:block;font-size:18px;color:#b02a5e}
+.face .big.wide{width:min(80vw,340px);aspect-ratio:189/109}
+.prof-intro{display:flex;gap:14px;align-items:center;padding:12px 16px 12px 10px;margin-bottom:12px;font-size:17px;color:var(--muted)}
+.prof-intro b{color:var(--text)}
+.prof-intro img{width:92px;flex:none}
+.kchars{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.kchar{font-family:var(--jp);font-size:26px;width:44px;height:44px;border-radius:10px;border:1px solid var(--line);background:rgba(255,255,255,.02);display:grid;place-items:center;line-height:1}
+.kchar:active{background:var(--pink-soft)}
+.kchar.got{border-color:var(--bronze);color:#f2e3c6}
+.krow-k{align-items:center}
+
+.sheet.paper{width:min(100%,520px);background:
+  radial-gradient(600px 300px at 20% 0%, rgba(255,255,255,.55), transparent 70%),
+  linear-gradient(180deg,#f6ecd9,#efe2c9);color:#2a1d1e;border:1px solid rgba(120,80,50,.3);box-shadow:0 20px 60px rgba(0,0,0,.6);border-radius:22px;padding:22px 20px 20px}
+.paper .icon-btn{border-color:rgba(80,50,30,.25);color:#2a1d1e;background:rgba(255,255,255,.4)}
+.paper .prof-top{position:absolute;top:-6px;right:52px;width:118px;pointer-events:none}
+.exp-head{display:flex;align-items:center;gap:14px;padding-right:150px;min-height:92px}
+.exp-kanji{font-size:72px;line-height:1;color:#2a1c1c}
+.exp-ru{font-size:28px;font-weight:700;line-height:1.1}
+.exp-read{font-size:18px;color:#7a6658;margin-top:4px}
+.exp-read .jp{color:#2a1d1e}
+.exp-note{margin:6px 0 0;color:#b02a5e;font-size:17px}
+.exp-board{position:relative;width:min(70vw,250px);aspect-ratio:1;margin:12px auto 0;border-radius:18px;background:rgba(255,255,255,.45);border:1px solid rgba(120,80,50,.22)}
+.exp-board svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.exp-cap{text-align:center;min-height:30px;margin-top:8px;font-size:20px}
+.exp-cap .jp{font-size:24px;color:#b02a5e}
+.exp-tools{display:flex;justify-content:center;margin:4px 0 6px}
+.paper-btn{border-color:rgba(80,50,30,.3);min-height:40px;font-size:16px}
+.exp-block{display:flex;gap:12px;align-items:flex-start;margin-top:12px;padding:12px;border-radius:16px;background:rgba(255,255,255,.4);border:1px solid rgba(120,80,50,.16)}
+.exp-block img{width:84px;flex:none;margin-top:-4px}
+.exp-block h4,.exp-origin summary{margin:0 0 4px;font-size:15px;letter-spacing:.12em;text-transform:uppercase;color:#b02a5e}
+.exp-block p{margin:0;font-size:18px;line-height:1.4}
+.exp-block p.lie{margin-top:8px;font-size:16px;color:#7a6658;font-style:italic}
+.exp-origin{margin-top:10px;padding:10px 12px;border-radius:16px;border:1px dashed rgba(120,80,50,.3)}
+.exp-origin summary{list-style:none;display:flex;align-items:center;gap:10px;cursor:pointer;margin:0}
+.exp-origin summary::-webkit-details-marker{display:none}
+.exp-origin summary img{width:56px}
+.exp-origin summary::after{content:"＋";margin-left:auto;font-size:18px;color:#7a6658}
+.exp-origin[open] summary::after{content:"－"}
+.exp-origin p{margin:8px 2px 2px;font-size:17px;line-height:1.45}
+.exp-actions{display:flex;justify-content:center;margin-top:16px}
+@media (max-width:520px){ .paper .prof-top{width:92px;right:46px} .exp-head{padding-right:110px} .exp-kanji{font-size:58px} .exp-ru{font-size:23px} }
+@media (max-width:520px){
+  .krow-k{flex-wrap:wrap}
+  .krow-k .rname{flex-basis:100%}
+  .krow-k .pips{width:100%;justify-content:flex-end;margin-top:4px}
+  .kchar{width:42px;height:42px;font-size:24px}
+  .prof-intro{font-size:15px}
+  .prof-intro img{width:70px}
+}
+@media (max-width:520px){ .exp-block img{width:62px} .exp-block p{font-size:17px} }

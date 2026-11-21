@@ -58,6 +58,14 @@ const LEVELS = {
 };
 
 let KANA = {};      // char -> {s:[d], n:[[x,y]]}
+let KANJI = {};     // то же для кандзи
+let LESSONS = { groups: [], kanji: {} };
+const getG = ch => KANA[ch] || KANJI[ch];
+const isKanji = ch => /[\u4E00-\u9FFF]/.test(ch);
+const lessonOf = ch => LESSONS.kanji[ch] || {};
+const hasStory = ch => { const l = lessonOf(ch); return !!(l.cat || l.origin); };
+const sayOf = ch => { const l = lessonOf(ch); return l.say || (l.kun || ch).replace(/[()（）]/g, ''); };
+const scriptOfChar = c => isKanji(c) ? 'j' : (/[\u30A0-\u30FF]/.test(c) ? 'k' : 'h');
 const REF = {};     // char -> [{pts, len}]
 
 /* ===================== ХРАНИЛИЩЕ ===================== */
@@ -68,7 +76,8 @@ const store = {
   set(v) { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) { mem[KEY] = v; } },
 };
 let S = Object.assign({ chars: {}, rows: {}, days: {}, settings: {} }, store.get() || {});
-S.settings = Object.assign({ strict: 'normal', flash: 2500, sound: true }, S.settings);
+S.settings = Object.assign({ strict: 'normal', flash: 2500, sound: true, calli: 'auto' }, S.settings);
+const calliActive = type => S.settings.calli === 'on' || (S.settings.calli === 'auto' && type === 'pen');
 const save = () => store.set(S);
 const today = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
 function streak() {
@@ -93,7 +102,7 @@ function refOf(ch) {
     measureSvg.style.cssText = 'position:absolute;width:109px;height:109px;left:-999px;top:-999px;visibility:hidden';
     document.body.appendChild(measureSvg);
   }
-  const k = KANA[ch]; if (!k) return null;
+  const k = getG(ch); if (!k) return null;
   REF[ch] = k.s.map(d => {
     const p = document.createElementNS(SVGNS, 'path'); p.setAttribute('d', d); measureSvg.appendChild(p);
     const len = p.getTotalLength(); const pts = [];
@@ -129,7 +138,33 @@ function devs(a, b) {
   const ends = Math.max((d[0] + d[1]) / 2, (d[N - 1] + d[N - 2]) / 2);
   return { mean, peak, ends };
 }
-const ENDS = 1.6;  // начало и конец черты — там прячутся отличия (わ/れ, ね/ぬ)
+// Режим каллиграфа: черта сравнивается как есть, со всеми хвостиками и дрожью.
+// Обычный режим: сглаживаем дрожь и срезаем «хвостики» касания/отрыва стилуса.
+let CALLI = false;
+const ENDS_CALLI = 1.6, ENDS_SOFT = 1.6; // начало и конец черты — там прячутся отличия (わ/れ, ね/ぬ)
+function smooth(pts) {
+  if (pts.length < 5) return pts;
+  return pts.map((p, i) => {
+    if (i === 0 || i === pts.length - 1) return p;
+    let x = 0, y = 0, c = 0;
+    for (let j = Math.max(0, i - 1); j <= Math.min(pts.length - 1, i + 1); j++) { x += pts[j][0]; y += pts[j][1]; c++; }
+    return [x / c, y / c, p[2]];
+  });
+}
+function trimStart(pts) {
+  const L = plen(pts); if (L < 14 || pts.length < 6) return pts;
+  const H = Math.min(3.5, L * 0.12); let acc = 0, k = 1;
+  for (; k < pts.length; k++) { acc += dist(pts[k - 1], pts[k]); if (acc >= H) break; }
+  if (k >= pts.length - 2) return pts;
+  let acc2 = 0, m = k + 1; const H2 = Math.max(6, L * 0.2);
+  for (; m < pts.length; m++) { acc2 += dist(pts[m - 1], pts[m]); if (acc2 >= H2) break; }
+  m = Math.min(m, pts.length - 1);
+  const a = [pts[k][0] - pts[0][0], pts[k][1] - pts[0][1]], b = [pts[m][0] - pts[k][0], pts[m][1] - pts[k][1]];
+  const cos = (a[0] * b[0] + a[1] * b[1]) / (Math.hypot(...a) * Math.hypot(...b) || 1);
+  return cos < 0.5 ? pts.slice(k) : pts; // резкий излом (больше 60°) в самом начале — это хвостик, а не черта
+}
+// Срезаем только хвостик касания в начале: конец черты — это はね и はらい, они часть знака (и отличают わ от れ).
+function clean(pts) { return trimStart(smooth(pts)); }
 const PEAK = 1.75; // насколько сильно может «уехать» отдельный кусок черты относительно среднего допуска
 const TOL = {
   lenient: { trace: 16, copy: 20, global: 16.5 },
@@ -138,6 +173,8 @@ const TOL = {
 };
 const tol = (kind) => TOL[S.settings.strict][kind];
 function strokeMatch(user, ref, t) {
+  if (!CALLI) user = clean(user);
+  const ENDS = CALLI ? ENDS_CALLI : ENDS_SOFT;
   const uL = plen(user), rL = ref.len;
   const f = devs(user, ref.pts), r = devs(user, ref.pts.slice().reverse());
   const sizeOk = rL < 14 ? uL < rL * 3 + 14 : (uL > rL * 0.38 && uL < rL * 2.4);
@@ -203,12 +240,26 @@ function speak(text) {
 }
 
 // SVG глифа по данным KanjiVG
-function glyphSVG(ch, { numbers = false, width = 4.2, color = 'var(--text)', cls = '' } = {}) {
-  const k = KANA[ch];
+function glyphSVG(ch, { numbers = false, width = null, color = 'var(--text)', cls = '' } = {}) {
+  if (ch && ch.length > 1 && [...ch].every(c => getG(c))) return multiGlyphSVG(ch, { numbers, width, color, cls });
+  const k = getG(ch);
+  if (width == null) width = isKanji(ch) ? 3.4 : 4.2;
   if (!k) return `<svg viewBox="0 0 109 109" class="${cls}"><text x="54.5" y="80" text-anchor="middle" font-size="80" fill="${color}" font-family="var(--jp)">${esc(ch)}</text></svg>`;
   const paths = k.s.map(d => `<path d="${d}"/>`).join('');
   const nums = numbers ? k.n.map(([x, y], i) => `<text x="${x}" y="${y}">${i + 1}</text>`).join('') : '';
   return `<svg viewBox="0 0 109 109" class="${cls}"><g fill="none" stroke="${color}" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round">${paths}</g>` +
+    (numbers ? `<g font-size="${isKanji(ch) ? 7 : 9}" fill="var(--pink)" font-family="Georgia,serif" font-weight="700">${nums}</g>` : '') + `</svg>`;
+}
+// Несколько знаков в одной строке (ёон: き + маленькая ゃ). Нумерация черт сквозная.
+function multiGlyphSVG(str, { numbers = false, width = null, color = 'var(--text)', cls = '' } = {}) {
+  const chars = [...str], step = 80, W = step * (chars.length - 1) + 109;
+  let n = 0, paths = '', nums = '';
+  chars.forEach((c, i) => {
+    const k = getG(c), dx = i * step;
+    paths += `<g transform="translate(${dx} 0)">${k.s.map(d => `<path d="${d}"/>`).join('')}</g>`;
+    if (numbers) k.n.forEach(([x, y]) => { n++; nums += `<text x="${x + dx}" y="${y}">${n}</text>`; });
+  });
+  return `<svg viewBox="0 0 ${W} 109" class="${cls}"><g fill="none" stroke="${color}" stroke-width="${width || 4.2}" stroke-linecap="round" stroke-linejoin="round">${paths}</g>` +
     (numbers ? `<g font-size="9" fill="var(--pink)" font-family="Georgia,serif" font-weight="700">${nums}</g>` : '') + `</svg>`;
 }
 // Анимация порядка черт внутри svg
@@ -241,7 +292,7 @@ function go(screen, arg) {
   if (current && current.leave) current.leave();
   current = null; closeModal();
   window.scrollTo(0, 0);
-  ({ home: renderHome, section: renderSection, table: renderTable, settings: renderSettings, practice: renderPractice, result: renderResult })[screen](arg);
+  ({ home: renderHome, section: renderSection, table: renderTable, settings: renderSettings, practice: renderPractice, result: renderResult, kanji: renderKanji })[screen](arg);
 }
 
 /* ===================== ГЛАВНАЯ ===================== */
@@ -251,7 +302,7 @@ function setProgress(set, script) {
   return { done, total: chars.length };
 }
 function weakList() {
-  return Object.entries(S.chars).filter(([c, v]) => v.fails > 0 && KANA[c])
+  return Object.entries(S.chars).filter(([c, v]) => v.fails > 0 && getG(c))
     .map(([c, v]) => [c, v.fails / Math.max(1, v.seen) + v.fails * 0.05]).sort((a, b) => b[1] - a[1]).slice(0, 8).map(x => x[0]);
 }
 function renderHome() {
@@ -260,6 +311,7 @@ function renderHome() {
   const mastered = ph.done + pk.done + pdh.done + pdk.done, total = ph.total + pk.total + pdh.total + pdk.total;
   const mirrorDone = Object.values(S.chars).filter(v => v.mirror).length;
   const weak = weakList();
+  const kj = Object.keys(LESSONS.kanji), kjDone = kj.filter(c => (S.chars[c] || {}).best >= 4).length;
   const p0 = PHRASES[0];
   app().innerHTML = `
   <header class="top">
@@ -276,7 +328,7 @@ function renderHome() {
   </section>
   <section class="card stats">
     <div class="stat"><b>${streak()}</b><span>дней подряд</span></div>
-    <div class="stat"><b>${mastered}</b><span>из ${total} по памяти</span></div>
+    <div class="stat"><b>${mastered + kjDone}</b><span>из ${total + kj.length} по памяти</span></div>
     <div class="stat"><b>${(S.days[today()] || 0)}</b><span>знаков сегодня</span></div>
   </section>
   <div class="section-title">Начертание</div>
@@ -285,6 +337,7 @@ function renderHome() {
     ${tile('kata', 'ア', 'Катакана', `${pk.done} / ${pk.total} по памяти`, pk.done / pk.total)}
     ${tile('dakuten', 'が', 'Дакутэн', 'Суровый раздел', (pdh.done + pdk.done) / (pdh.total + pdk.total), 'fire')}
     ${tile('mirror', 'あ<small style="font-size:.5em;color:var(--muted)">⇄</small>ア', 'Зеркало', mirrorDone ? `Видишь одно — пишешь пару · ${mirrorDone} готово` : 'Видишь одно — пишешь пару', null)}
+    <button class="card tile" data-go="kanji"><span class="glyph">漢</span><img class="stk" src="img/prof-point.webp" alt="" style="width:104px;top:-4px;right:-8px"><h3>Кандзи</h3><p>${kjDone} / ${kj.length} по памяти · кот объяснит</p><div class="bar"><i style="width:${Math.round(kjDone / Math.max(1, kj.length) * 100)}%"></i></div></button>
     <button class="card tile" data-go="table"><span class="glyph">表</span><img class="stk" src="img/reading.webp" alt=""><h3>Таблица</h3><p>Карточки, ряды, пары</p></button>
     ${weak.length ? `<button class="card tile" data-act="weak"><span class="glyph">弱</span><img class="stk" src="img/slime-green.webp" alt="" style="width:70px;top:4px;right:6px"><h3>Слабые знаки</h3><p class="jp" style="font-size:20px;color:var(--text)">${weak.join('')}</p></button>` : ''}
   </section>
@@ -292,7 +345,6 @@ function renderHome() {
   <section class="tiles">
     <div class="card tile locked"><span class="glyph">速</span><span class="lock">скоро</span><h3>Арена</h3><p>На время: писать и узнавать</p></div>
     <div class="card tile locked"><span class="glyph">違</span><span class="lock">скоро</span><h3>Найди отличие</h3><p>Три знака, одна закорючка</p></div>
-    <div class="card tile wide locked" style="opacity:.75"><span class="glyph">漢</span><img class="stk" src="img/bed.webp" alt=""><h3>Кандзи</h3><p>Кот спит здесь до весны. Не будить.</p></div>
   </section>`;
   bindNav();
   const cat = $('#cat'), bubble = $('#bubble'); let pi = 0;
@@ -305,7 +357,7 @@ function renderHome() {
   });
   const w = $('[data-act="weak"]');
   if (w) w.addEventListener('click', () => {
-    const items = weak.map(c => ({ ch: c, mode: 'recall', script: /[゠-ヿ]/.test(c) ? 'k' : 'h' }));
+    const items = weak.map(c => ({ ch: c, mode: 'recall', script: scriptOfChar(c) }));
     go('practice', { set: 'weak', row: 'weak', level: 4, items, title: 'Слабые знаки' });
   });
 }
@@ -358,6 +410,7 @@ function renderSection(set) {
   $$('[data-mix]').forEach(b => b.addEventListener('click', () => startRow(set, script, 'mix', b.dataset.mix)));
 }
 function startRow(set, script, rowId, lv) {
+  if (set === 'kanji') return startKanji(rowId, lv);
   const cfg = SETS[set];
   let base = [];
   if (rowId === 'mix') { cfg.rows.forEach(r => base.push(...rowChars(r))); base = shuffle(base).slice(0, 10); }
@@ -386,6 +439,7 @@ function Board(el) {
   const canvas = $('canvas', el), ctx = canvas.getContext('2d');
   const B = { el, guide: $('.layer-guide', el), done: $('.layer-done', el), overlay: $('.layer-overlay', el), strokes: [], enabled: true, onStroke: null, onStart: null };
   let cur = null, penSeen = false, size = 0, dpr = 1, ink = '#ece2d0';
+  B.lastType = 'touch'; B.inkScale = 1;
   function fit() {
     const r = el.getBoundingClientRect(); size = r.width; dpr = Math.min(3, window.devicePixelRatio || 1);
     canvas.width = Math.round(size * dpr); canvas.height = Math.round(size * dpr); redraw();
@@ -393,7 +447,7 @@ function Board(el) {
   const toPx = v => v / 109 * size;
   function seg(a, b, color) {
     ctx.strokeStyle = color; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    ctx.lineWidth = toPx(3.6) * (0.55 + (b[2] ?? 0.5) * 0.9);
+    ctx.lineWidth = toPx(3.6 * B.inkScale) * (0.55 + (b[2] ?? 0.5) * 0.9);
     ctx.beginPath(); ctx.moveTo(toPx(a[0]), toPx(a[1])); ctx.lineTo(toPx(b[0]), toPx(b[1])); ctx.stroke();
   }
   function drawStroke(s, color) {
@@ -415,7 +469,7 @@ function Board(el) {
     if (e.pointerType === 'pen') penSeen = true;
     else if (e.pointerType === 'touch' && penSeen) return; // ладонь не пишет, если есть Pencil
     e.preventDefault(); canvas.setPointerCapture(e.pointerId);
-    cur = { id: e.pointerId, s: [pt(e)] }; B.onStart && B.onStart();
+    cur = { id: e.pointerId, s: [pt(e)] }; B.lastType = e.pointerType; B.onStart && B.onStart();
     redraw(); drawStroke(cur.s, ink);
   });
   canvas.addEventListener('pointermove', e => {
@@ -445,6 +499,11 @@ function Board(el) {
   requestAnimationFrame(fit);
   return B;
 }
+let GW = 4.2; // толщина эталонной черты: 4.2 для каны, 3.4 для кандзи
+const PART_COLORS = ['#ff8fb5', '#7cc4e8', '#a3cf45', '#f0b25a'];
+const sayItem = it => it.script === 'j' ? sayOf(it.ch) : it.ch;
+const readingsOf = ch => { const l = lessonOf(ch); return [l.kun, l.on].filter(Boolean).map(x => `<span class="jp">${x}</span>`).join(' · '); };
+const backFrom = cfg => cfg.set === 'weak' ? go('home') : cfg.set === 'kanji' ? go('kanji') : go('section', cfg.set);
 const pathEl = (d, attrs) => { const p = document.createElementNS(SVGNS, 'path'); p.setAttribute('d', d); for (const k in attrs) p.setAttribute(k, attrs[k]); return p; };
 const STROKE = { fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
 
@@ -454,7 +513,7 @@ function renderPractice(cfg) {
   const total = () => ses.queue.length;
   app().innerHTML = `
   <div class="practice">
-    <header class="ptop"><button class="icon-btn" id="quit" aria-label="Выйти">${ICON.close}</button><div class="pdots" id="dots"></div><div class="plevel">${esc(cfg.title)}</div></header>
+    <header class="ptop"><button class="icon-btn" id="quit" aria-label="Выйти">${ICON.close}</button><div class="pdots" id="dots"></div><div class="plevel"><span class="calli" id="calli">書 каллиграф</span>${esc(cfg.title)}</div></header>
     <div class="prompt" id="prompt"></div>
     <div class="board-wrap"><div class="board" id="board"></div><div class="flashbar" id="fbar"><i></i></div></div>
     <div class="feedback" id="fb"></div>
@@ -465,7 +524,8 @@ function renderPractice(cfg) {
   let st = null;
   const T = (f, ms) => { const t = setTimeout(f, ms); ses.timers.push(t); return t; };
   current = { leave() { ses.timers.forEach(clearTimeout); board.destroy(); try { speechSynthesis.cancel(); } catch (e) {} } };
-  $('#quit').addEventListener('click', () => cfg.set === 'weak' ? go('home') : go('section', cfg.set));
+  $('#quit').addEventListener('click', () => backFrom(cfg));
+  ses.fails = {};
 
   function dots() {
     $('#dots').innerHTML = ses.queue.map((it, i) => {
@@ -477,26 +537,57 @@ function renderPractice(cfg) {
     ses.timers.forEach(clearTimeout); ses.timers = [];
     const it = ses.queue[ses.idx];
     const refs = refOf(it.ch);
+    const kj = it.script === 'j';
+    board.inkScale = kj ? 0.82 : 1; GW = kj ? 3.4 : 4.2;
     st = { it, refs, live: it.mode === 'trace' || it.mode === 'copy', cur: 0, misses: 0, strokeMiss: 0, checking: false, autoT: null, failed: false };
     board.clear(); board.guide.innerHTML = ''; board.done.innerHTML = ''; board.overlay.innerHTML = '';
     board.el.classList.remove('win', 'lose'); board.enabled = true; board.setInk('#ece2d0');
     dots(); setFb('');
     // подсказка над доской
-    const rom = romOf(it.ch), hint = hintOf(it.ch);
-    const scriptTag = `<span class="tag">${it.script === 'k' ? 'カタカナ' : 'ひらがな'}</span>`;
+    const rom = kj ? esc(lessonOf(it.ch).ru || '') : romOf(it.ch), hint = kj ? readingsOf(it.ch) : hintOf(it.ch);
+    const scriptTag = `<span class="tag">${kj ? '漢字' : it.script === 'k' ? 'カタカナ' : 'ひらがな'}</span>`;
     let sample = '';
-    if (it.mode === 'copy') sample = `<div class="sample card">${glyphSVG(it.ch, { numbers: true, width: 4 })}</div>`;
+    if (it.mode === 'copy') sample = `<div class="sample card">${glyphSVG(it.ch, { numbers: true, width: kj ? 3.2 : 4 })}</div>`;
     if (it.mode === 'mirror') sample = `<div class="sample card">${glyphSVG(it.from, { width: 4.4 })}</div>`;
-    promptEl.innerHTML = `${sample}<div class="ptext"><div class="romaji">${rom}</div><div class="phint">${scriptTag}${hint ? ' · ' + hint : ''}${it.mode === 'mirror' ? ' · напиши пару' : ''}</div></div>
+    promptEl.innerHTML = `${sample}<div class="ptext"><div class="romaji ${kj ? 'meaning' : ''}">${rom}</div><div class="phint">${scriptTag}${hint ? ' · ' + hint : ''}${it.mode === 'mirror' ? ' · напиши пару' : ''}</div></div>
       <button class="icon-btn" id="say" aria-label="Озвучить">${ICON.sound}</button>`;
-    $('#say').addEventListener('click', () => speak(it.ch));
+    $('#say').addEventListener('click', () => speak(sayItem(it)));
+    calliBadge();
     // кнопки
-    if (st.live) btns.innerHTML = `<button class="btn ghost" id="b-hint">💡 Подсказка</button><button class="btn ghost" id="b-restart">Заново</button>`;
-    else btns.innerHTML = `<button class="btn ghost" id="b-undo">↶ Черта</button><button class="btn ghost" id="b-clear">Стереть</button>${it.mode === 'flash' ? '<button class="btn ghost" id="b-reflash">👁 Ещё раз</button>' : ''}<button class="btn primary" id="b-done">Готово</button>`;
-    bindButtons();
+    const catBtn = kj && hasStory(it.ch) ? '<button class="btn ghost" id="b-cat">🐈‍⬛ Кот, объясни</button>' : '';
+    const partsBtn = kj && !st.live ? '<button class="btn ghost" id="b-parts">🧩 Части</button>' : '';
+    if (st.live) btns.innerHTML = `<button class="btn ghost" id="b-hint">💡 Подсказка</button><button class="btn ghost" id="b-restart">Заново</button>${catBtn}`;
+    else btns.innerHTML = `<button class="btn ghost" id="b-undo">↶ Черта</button><button class="btn ghost" id="b-clear">Стереть</button>${it.mode === 'flash' ? '<button class="btn ghost" id="b-reflash">👁 Ещё раз</button>' : ''}${partsBtn}${catBtn}<button class="btn primary" id="b-done">Готово</button>`;
+    bindButtons(); btns.style.display = '';
     if (it.mode === 'trace') drawTraceGuide();
     if (it.mode === 'flash') doFlash();
-    T(() => speak(it.ch), 250);
+    T(() => speak(sayItem(it)), 250);
+  }
+  function calliBadge() { const el = $('#calli'); if (el) el.classList.toggle('on', calliActive(board.lastType)); }
+  function askCat(fromFail) {
+    if (!st.live && (st.it.mode === 'flash' || st.it.mode === 'recall')) st.misses++;
+    openExplain(st.it.ch, { fromFail, onWrite: () => {
+      closeModal(); clearTimeout(st.autoT); st.checking = false; board.enabled = true; btns.style.display = '';
+      board.clear(); board.overlay.innerHTML = ''; board.el.classList.remove('lose'); setFb('<span class="muted">Теперь по памяти ✍️</span>');
+      if (st.live) { st.cur = 0; board.done.innerHTML = ''; if (st.it.mode === 'trace') drawTraceGuide(); }
+    } });
+  }
+  // «Кот возвращает части на поле»: каждая часть своим цветом на пару секунд
+  function showParts() {
+    st.misses++;
+    const ov = board.overlay; ov.innerHTML = '';
+    const g = getG(st.it.ch), L = lessonOf(st.it.ch);
+    const parts = L.parts || [{ s: g.s.map((_, i) => i), label: '', note: '' }];
+    parts.forEach((pt, k) => {
+      const col = PART_COLORS[k % PART_COLORS.length];
+      pt.s.forEach(i => ov.appendChild(pathEl(g.s[i], Object.assign({ stroke: col, 'stroke-width': 4, opacity: .75 }, STROKE))));
+      if (pt.note) { const bb = bbox(pt.s.map(i => st.refs[i].pts)); const t = document.createElementNS(SVGNS, 'text');
+        t.setAttribute('x', bb.cx); t.setAttribute('y', bb.cy + 1.6); t.setAttribute('text-anchor', 'middle'); t.setAttribute('font-size', '4.6');
+        t.setAttribute('stroke', '#17131a'); t.setAttribute('stroke-width', '1.4'); t.setAttribute('paint-order', 'stroke');
+        t.setAttribute('fill', col); t.setAttribute('font-family', 'Georgia,serif'); t.setAttribute('font-weight', '700'); t.textContent = pt.note; ov.appendChild(t); }
+    });
+    ov.style.transition = ''; ov.style.opacity = 1;
+    T(() => { ov.style.transition = 'opacity .5s'; ov.style.opacity = 0; T(() => { ov.innerHTML = ''; ov.style.opacity = 1; ov.style.transition = ''; }, 520); }, 2300);
   }
 
   function bindButtons() {
@@ -507,21 +598,23 @@ function renderPractice(cfg) {
     on('b-clear', () => { if (st.checking) return; clearTimeout(st.autoT); board.clear(); board.overlay.innerHTML = ''; setFb(''); });
     on('b-reflash', () => { st.misses++; st.peeked = true; board.clear(); doFlash(); });
     on('b-done', () => { if (!st.checking) checkAll(); });
+    on('b-cat', () => askCat(false));
+    on('b-parts', () => { if (!st.checking) showParts(); });
   }
 
   // уровень 1: пунктир + бегущая подсказка направления
   function drawTraceGuide() {
     const g = board.guide; g.innerHTML = '';
-    KANA[st.it.ch].s.forEach((d, i) => {
-      g.appendChild(pathEl(d, Object.assign({ stroke: 'rgba(236,226,208,.42)', 'stroke-width': 2.2, 'stroke-dasharray': '2.4 2.6' }, STROKE)));
+    getG(st.it.ch).s.forEach((d, i) => {
+      g.appendChild(pathEl(d, Object.assign({ stroke: 'rgba(236,226,208,.42)', 'stroke-width': GW === 4.2 ? 2.2 : 1.7, 'stroke-dasharray': GW === 4.2 ? '2.4 2.6' : '1.8 2' }, STROKE)));
     });
     markNext();
   }
   function markNext() {
     $$('.nextmark', board.guide).forEach(n => n.remove());
     if (st.cur >= st.refs.length) return;
-    const d = KANA[st.it.ch].s[st.cur], ref = st.refs[st.cur];
-    const hl = pathEl(d, Object.assign({ stroke: 'rgba(226,72,127,.42)', 'stroke-width': 5.2, class: 'nextmark' }, STROKE));
+    const d = getG(st.it.ch).s[st.cur], ref = st.refs[st.cur];
+    const hl = pathEl(d, Object.assign({ stroke: 'rgba(226,72,127,.42)', 'stroke-width': GW + 1, class: 'nextmark' }, STROKE));
     board.guide.appendChild(hl);
     const comet = pathEl(d, Object.assign({ stroke: '#ff8fb5', 'stroke-width': 3.2, class: 'nextmark', 'stroke-dasharray': `7 ${ref.len + 20}` }, STROKE));
     board.guide.appendChild(comet);
@@ -529,22 +622,22 @@ function renderPractice(cfg) {
     const [sx, sy] = ref.pts[0];
     const dot = document.createElementNS(SVGNS, 'circle'); dot.setAttribute('cx', sx); dot.setAttribute('cy', sy); dot.setAttribute('r', 2.6); dot.setAttribute('fill', '#ff8fb5'); dot.setAttribute('class', 'nextmark');
     board.guide.appendChild(dot);
-    const [nx, ny] = KANA[st.it.ch].n[st.cur];
+    const [nx, ny] = getG(st.it.ch).n[st.cur];
     const t = document.createElementNS(SVGNS, 'text'); t.setAttribute('x', nx); t.setAttribute('y', ny); t.setAttribute('class', 'nextmark');
-    t.setAttribute('font-size', '8'); t.setAttribute('fill', '#ff8fb5'); t.setAttribute('font-weight', '700'); t.setAttribute('font-family', 'Georgia,serif'); t.textContent = st.cur + 1;
+    t.setAttribute('font-size', GW === 4.2 ? '8' : '6.5'); t.setAttribute('fill', '#ff8fb5'); t.setAttribute('font-weight', '700'); t.setAttribute('font-family', 'Georgia,serif'); t.textContent = st.cur + 1;
     board.guide.appendChild(t);
   }
   function hintStroke(i) {
     if (i >= st.refs.length) return;
-    const d = KANA[st.it.ch].s[i], L = st.refs[i].len;
+    const d = getG(st.it.ch).s[i], L = st.refs[i].len;
     const p = pathEl(d, Object.assign({ stroke: '#ff8fb5', 'stroke-width': 4.4, 'stroke-dasharray': `${L} ${L}`, 'stroke-dashoffset': L }, STROKE));
     board.overlay.appendChild(p);
     const a = p.animate([{ strokeDashoffset: L, opacity: 1 }, { strokeDashoffset: 0, opacity: 1, offset: .7 }, { strokeDashoffset: 0, opacity: 0 }], { duration: Math.max(900, L * 26), easing: 'ease-in-out' });
     a.onfinish = () => p.remove();
   }
   function snap(i) {
-    const d = KANA[st.it.ch].s[i], L = st.refs[i].len;
-    const p = pathEl(d, Object.assign({ stroke: '#ece2d0', 'stroke-width': 4.2 }, STROKE));
+    const d = getG(st.it.ch).s[i], L = st.refs[i].len;
+    const p = pathEl(d, Object.assign({ stroke: '#ece2d0', 'stroke-width': GW }, STROKE));
     board.done.appendChild(p);
     p.animate([{ strokeDasharray: `${L} ${L}`, strokeDashoffset: L * .6 }, { strokeDasharray: `${L} ${L}`, strokeDashoffset: 0 }], { duration: 160 });
   }
@@ -552,7 +645,7 @@ function renderPractice(cfg) {
   // уровень 3: вспышка
   function doFlash() {
     board.enabled = false;
-    board.guide.innerHTML = glyphSVG(st.it.ch, { width: 4.2 }).replace(/^<svg[^>]*>|<\/svg>$/g, '');
+    board.guide.innerHTML = glyphSVG(st.it.ch, { width: GW }).replace(/^<svg[^>]*>|<\/svg>$/g, '');
     board.guide.style.opacity = 1; board.guide.style.transition = '';
     const ms = S.settings.flash;
     fbar.classList.add('on'); const bar = $('i', fbar);
@@ -574,6 +667,7 @@ function renderPractice(cfg) {
   };
 
   function liveStroke(s) {
+    CALLI = calliActive(board.lastType); calliBadge();
     const t = tol(st.it.mode === 'trace' ? 'trace' : 'copy');
     const r = checkLive(s, st.refs, st.cur, t);
     if (r.kind === 'ok') {
@@ -594,13 +688,15 @@ function renderPractice(cfg) {
   function checkAll() {
     clearTimeout(st.autoT); st.autoT = null;
     if (!board.strokes.length) return;
+    CALLI = calliActive(board.lastType); calliBadge();
     const res = checkWhole(board.strokes, st.refs, tol('global'));
-    if (res.ok) { board.setInk('#a3cf45'); return finishItem(!st.misses && !st.failed); }
-    st.failed = true; st.checking = true; board.enabled = false;
+    if (res.ok) { ses.fails[st.it.ch] = 0; board.setInk('#a3cf45'); return finishItem(!st.misses && !st.failed); }
+    ses.fails[st.it.ch] = (ses.fails[st.it.ch] || 0) + 1;
+    st.failed = true; st.checking = true; board.enabled = false; btns.style.display = 'none';
     board.el.classList.add('lose');
     // разбор: образец бледно + твои черты в цвете
     const ov = board.overlay; ov.innerHTML = '';
-    KANA[st.it.ch].s.forEach(d => ov.appendChild(pathEl(d, Object.assign({ stroke: 'rgba(236,226,208,.22)', 'stroke-width': 5 }, STROKE))));
+    getG(st.it.ch).s.forEach(d => ov.appendChild(pathEl(d, Object.assign({ stroke: 'rgba(236,226,208,.22)', 'stroke-width': GW + 0.8 }, STROKE))));
     res.norm.forEach((s, i) => {
       const ok = res.per[i] ? res.per[i].ok : false;
       const d = 'M' + s.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join('L');
@@ -619,9 +715,12 @@ function renderPractice(cfg) {
       else if (sw) msg = `Перепутан порядок: черта №${sw[1] + 1} должна быть №${sw[0].swap + 1}`;
       else msg = `Не похожи черты: ${bad.map(([, i]) => '№' + (i + 1)).join(', ')}`;
     }
-    setFb(`<span class="warn">${msg}</span><div class="row-btns"><button class="btn ghost" id="f-anim">${ICON.play.replace('<svg', '<svg width="14" height="14" style="fill:currentColor;stroke:none"')} Показать</button><button class="btn" id="f-retry">Ещё раз</button><button class="btn primary" id="f-next">Дальше</button></div>`);
-    $('#f-anim').addEventListener('click', () => { ov.innerHTML = glyphSVG(st.it.ch, { width: 4.4, color: '#ff8fb5' }).replace(/^<svg[^>]*>|<\/svg>$/g, ''); animateStrokes(ov); });
-    $('#f-retry').addEventListener('click', () => { st.checking = false; board.enabled = true; board.overlay.innerHTML = ''; board.el.classList.remove('lose'); setFb(''); if (st.it.mode === 'flash') doFlash(); });
+    const offer = st.it.script === 'j' && hasStory(st.it.ch) && ses.fails[st.it.ch] >= 2
+      ? `<button class="cat-offer" id="f-cat"><img src="img/prof-wrong.webp" alt=""><span><b>Опять рассыпается?</b>Позвать кота — он разберёт знак по частям</span></button>` : '';
+    setFb(`<span class="warn">${msg}</span>${offer}<div class="row-btns"><button class="btn ghost" id="f-anim">${ICON.play.replace('<svg', '<svg width="14" height="14" style="fill:currentColor;stroke:none"')} Показать</button><button class="btn" id="f-retry">Ещё раз</button><button class="btn primary" id="f-next">Дальше</button></div>`);
+    if (offer) $('#f-cat').addEventListener('click', () => askCat(true));
+    $('#f-anim').addEventListener('click', () => { ov.innerHTML = glyphSVG(st.it.ch, { width: GW + 0.2, color: '#ff8fb5' }).replace(/^<svg[^>]*>|<\/svg>$/g, ''); animateStrokes(ov); });
+    $('#f-retry').addEventListener('click', () => { btns.style.display = ''; st.checking = false; board.enabled = true; board.overlay.innerHTML = ''; board.el.classList.remove('lose'); setFb(''); if (st.it.mode === 'flash') doFlash(); });
     $('#f-next').addEventListener('click', () => finishItem(false, true));
   }
 
@@ -667,23 +766,23 @@ function renderResult({ cfg, perfect, missed, total }) {
   const canNext = typeof cfg.level === 'number' && cfg.level < 4 && cfg.row !== 'weak';
   app().innerHTML = `
   <div class="result">
-    <img src="img/${perfect ? 'goukaku' : missed.length <= 1 ? 'ramen' : 'ganbare'}.webp" alt="">
+    <img src="img/${cfg.set === 'kanji' ? (perfect ? 'prof-brush' : missed.length <= 1 ? 'prof-glasses' : 'prof-wrong') : (perfect ? 'goukaku' : missed.length <= 1 ? 'ramen' : 'ganbare')}.webp" alt="">
     <h2>${perfect ? 'Чисто! 合格' : missed.length <= 1 ? 'Почти идеально' : 'Есть над чем поработать'}</h2>
     <div class="score">${clean} из ${total} без единой ошибки</div>
     ${missed.length ? `<div class="redo">${missed.map(c => `<span>${c}</span>`).join('')}</div><div class="muted">Эти знаки попадут в «Слабые»</div>` : ''}
     <div class="actions">
       ${canNext ? `<button class="btn primary" id="r-next">Следующий уровень · ${LEVELS[cfg.level + 1].name}</button>` : ''}
       <button class="btn ${canNext ? '' : 'primary'}" id="r-again">Ещё раз</button>
-      <button class="btn ghost" id="r-back">${cfg.set === 'weak' ? 'На главную' : 'К рядам'}</button>
+      <button class="btn ghost" id="r-back">${cfg.set === 'weak' ? 'На главную' : cfg.set === 'kanji' ? 'К кандзи' : 'К рядам'}</button>
     </div>
   </div>`;
   const again = () => {
-    if (cfg.set === 'weak') { const items = weakList().map(c => ({ ch: c, mode: 'recall', script: /[゠-ヿ]/.test(c) ? 'k' : 'h' })); return items.length ? go('practice', Object.assign({}, cfg, { items })) : go('home'); }
+    if (cfg.set === 'weak') { const items = weakList().map(c => ({ ch: c, mode: 'recall', script: scriptOfChar(c) })); return items.length ? go('practice', Object.assign({}, cfg, { items })) : go('home'); }
     if (cfg.level === 'm') return startRow(cfg.set, cfg.script, cfg.row, 'm');
     startRow(cfg.set, cfg.script, cfg.row, cfg.level);
   };
   $('#r-again').addEventListener('click', again);
-  $('#r-back').addEventListener('click', () => cfg.set === 'weak' ? go('home') : go('section', cfg.set));
+  $('#r-back').addEventListener('click', () => backFrom(cfg));
   if (canNext) $('#r-next').addEventListener('click', () => startRow(cfg.set, cfg.script, cfg.row, cfg.level + 1));
   speak(perfect ? 'ごうかく' : 'がんばれ');
 }
@@ -710,12 +809,13 @@ function renderTable() {
   $$('.khead').forEach(b => b.addEventListener('click', () => openRow(rows.find(r => r.id === b.dataset.row))));
 }
 function faceHTML(ch, script, other, cls) {
-  const isKana = !!KANA[ch];
+  const chars = [...ch], have = chars.every(c => KANA[c]);
+  const strokes = have ? chars.reduce((n, c) => n + KANA[c].s.length, 0) : 0;
   return `<div class="face ${cls}">
     <div class="script">${script}</div>
-    <div class="big">${isKana ? glyphSVG(ch, { numbers: true, width: 4.4 }) : `<div class="fontglyph">${ch}</div>`}</div>
+    <div class="big ${chars.length > 1 ? 'wide' : ''}">${have ? glyphSVG(ch, { numbers: true, width: 4.4 }) : `<div class="fontglyph">${ch}</div>`}</div>
     <div class="rom">${romOf(ch)}</div>
-    <div class="pair">пара: <span class="jp">${other}</span>${KANA[ch] ? ` · черт: ${KANA[ch].s.length}` : ''}</div>
+    <div class="pair">пара: <span class="jp">${other}</span>${strokes ? ` · черт: ${strokes}` : ''}</div>
   </div>`;
 }
 function openCard(hira, startKata) {
@@ -750,6 +850,152 @@ function modal(inner) {
 }
 function closeModal() { const r = $('#modal-root'); if (r) r.innerHTML = ''; }
 
+
+/* ===================== КАНДЗИ ===================== */
+function renderKanji() {
+  const groups = LESSONS.groups;
+  const rows = groups.map(g => {
+    const pips = [1, 2, 3, 4].map(lv => { const st = S.rows[rowKey('kanji', 'j', g.id, lv)] || {};
+      return `<button class="pip ${st.perfect ? 'perfect' : st.done ? 'done' : ''}" data-row="${g.id}" data-lv="${lv}">${lv}</button>`; }).join('');
+    const chars = [...g.chars].map(c => `<button class="kchar ${(S.chars[c] || {}).best >= 4 ? 'got' : ''}" data-k="${c}">${c}</button>`).join('');
+    return `<div class="card row krow-k"><div class="rname"><b>${esc(g.title)}</b><div class="kchars">${chars}</div></div><div class="pips">${pips}</div></div>`;
+  }).join('');
+  app().innerHTML = `
+  <header class="top"><button class="icon-btn" data-go="home">${ICON.back}</button><h1>Кандзи<small class="jp">漢字</small></h1></header>
+  <div class="card prof-intro"><img src="img/prof-point.webp" alt=""><div><b>Кот-профессор на месте.</b> Нажми на знак — карточка с порядком черт. Где у знака есть история, появится «Кот, объясни». Подсказки — смысл и чтения: <span class="jp">くん</span> хираганой, <span class="jp">オン</span> катаканой.</div></div>
+  <div class="legend"><span><b>①</b> обвести</span><span><b>②</b> срисовать</span><span><b>③</b> вспышка</span><span><b>④</b> по памяти</span></div>
+  <div class="rows">${rows}</div>
+  <div class="section-title">Микс по всем группам</div>
+  <div class="card mixbar"><div class="grow"><b>10 случайных</b><span class="muted">кандзи вперемешку</span></div>
+    <button class="btn" data-mix="3">③ Вспышка</button><button class="btn primary" data-mix="4">④ По памяти</button></div>`;
+  bindNav();
+  $$('[data-row]').forEach(b => b.addEventListener('click', () => startKanji(b.dataset.row, b.dataset.lv)));
+  $$('[data-mix]').forEach(b => b.addEventListener('click', () => startKanji('mix', b.dataset.mix)));
+  $$('.kchar').forEach(b => b.addEventListener('click', () => openKanjiCard(b.dataset.k)));
+}
+function startKanji(groupId, lv) {
+  lv = +lv;
+  let chars;
+  if (groupId === 'mix') chars = shuffle(LESSONS.groups.flatMap(g => [...g.chars])).slice(0, 10);
+  else chars = [...LESSONS.groups.find(g => g.id === groupId).chars];
+  let items = chars.map(c => ({ ch: c, mode: LEVELS[lv].mode, script: 'j' }));
+  if (lv > 1 && groupId !== 'mix') items = shuffle(items);
+  go('practice', { set: 'kanji', script: 'j', row: groupId, level: lv, items, title: LEVELS[lv].name });
+}
+function openKanjiCard(ch) {
+  const l = lessonOf(ch), g = getG(ch);
+  modal(`<div class="face">
+      <div class="script">漢字 · черт: ${g.s.length}</div>
+      <div class="big">${glyphSVG(ch, { numbers: true })}</div>
+      <div class="rom">${esc(l.ru || '')}</div>
+      <div class="pair">${readingsOf(ch)}</div>
+    </div>
+    <div class="tools"><button class="btn" id="c-play">${ICON.play.replace('<svg', '<svg width="16" height="16" style="fill:currentColor;stroke:none"')} Порядок черт</button><button class="btn" id="c-say">${ICON.sound.replace('<svg', '<svg width="18" height="18" style="fill:none;stroke:currentColor;stroke-width:2"')}</button>${hasStory(ch) ? '<button class="btn primary" id="c-cat">🐈‍⬛ Кот, объясни</button>' : ''}</div>`);
+  const play = () => { const svg = $('#modal .big svg'); if (svg) animateStrokes(svg, { speed: 9, gap: 90 }); };
+  $('#c-play').addEventListener('click', play);
+  $('#c-say').addEventListener('click', () => speak(sayOf(ch)));
+  const c = $('#c-cat'); if (c) c.addEventListener('click', () => openExplain(ch, {}));
+  setTimeout(play, 250); speak(sayOf(ch));
+}
+
+/* ---------- «Кот, объясни»: бумажный лист ---------- */
+let asmToken = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function openExplain(ch, { onWrite, fromFail } = {}) {
+  const l = lessonOf(ch);
+  const root = $('#modal-root');
+  root.innerHTML = `<div class="modal" id="modal"><div class="sheet paper">
+    <button class="icon-btn close" id="m-close">${ICON.close}</button>
+    <img class="prof-top" src="img/${fromFail ? 'prof-wrong' : 'prof-point'}.webp" alt="">
+    <div class="exp-head"><div class="exp-kanji jp">${ch}</div><div><div class="exp-ru">${esc(l.ru || '')}</div><div class="exp-read">${readingsOf(ch)}</div></div></div>
+    ${fromFail ? '<div class="exp-note">Опять рассыпается? Разбираем по частям.</div>' : ''}
+    <div class="exp-board"><svg viewBox="0 0 109 109"><g stroke="rgba(120,80,50,.18)" stroke-width=".5" stroke-dasharray="2 2"><path d="M54.5 6V103M6 54.5H103"/></g></svg><svg viewBox="0 0 109 109" id="asm"></svg></div>
+    <div class="exp-cap" id="asm-cap">&nbsp;</div>
+    <div class="exp-tools"><button class="btn paper-btn" id="asm-again">↻ Ещё раз</button></div>
+    ${l.cat ? `<div class="exp-block"><img src="img/prof-glasses.webp" alt=""><div><h4>Запоминалка кота</h4><p>${esc(l.cat)}</p>${l.catLies ? '<p class="lie">Кот приврал. Честная версия — ниже 👇</p>' : ''}</div></div>` : ''}
+    ${l.origin ? `<details class="exp-origin" ${l.catLies ? 'open' : ''}><summary><img src="img/prof-book.webp" alt=""><span>Откуда взялся знак</span></summary><p>${esc(l.origin)}</p></details>` : ''}
+    <div class="exp-actions">${onWrite ? '<button class="btn primary" id="exp-write">Написать по памяти</button>' : '<button class="btn primary" id="exp-train">Понятно, кот</button>'}</div>
+  </div></div>`;
+  const close = () => { asmToken++; closeModal(); };
+  $('#m-close').addEventListener('click', close);
+  $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') close(); });
+  const run = () => assemble($('#asm'), ch, $('#asm-cap'));
+  $('#asm-again').addEventListener('click', run);
+  if (onWrite) $('#exp-write').addEventListener('click', () => { asmToken++; onWrite(); });
+  else $('#exp-train').addEventListener('click', close);
+  setTimeout(run, 200);
+}
+// Сборка знака из частей по разметке KanjiVG. С цепочкой (木 → 林 → 森)
+// предыдущий знак уезжает на своё место внутри следующего.
+async function assemble(svg, ch, cap) {
+  const my = ++asmToken, alive = () => my === asmToken && document.body.contains(svg);
+  const INK = '#2a1c1c';
+  const strokesG = (c, idx, color, width) => {
+    const g = document.createElementNS(SVGNS, 'g'); const data = getG(c);
+    g.setAttribute('fill', 'none'); g.setAttribute('stroke', color); g.setAttribute('stroke-width', width || 3.6);
+    g.setAttribute('stroke-linecap', 'round'); g.setAttribute('stroke-linejoin', 'round');
+    (idx || data.s.map((_, i) => i)).forEach(i => g.appendChild(pathEl(data.s[i], {})));
+    g.style.transformOrigin = '0 0'; svg.appendChild(g); return g;
+  };
+  const draw = async (g, speed = 10) => {
+    for (const p of g.querySelectorAll('path')) {
+      if (!alive()) return;
+      const L = p.getTotalLength(); p.style.strokeDasharray = `${L} ${L}`;
+      const dur = Math.max(220, L * speed);
+      await p.animate([{ strokeDashoffset: L }, { strokeDashoffset: 0 }], { duration: dur, fill: 'forwards', easing: 'ease-in-out' }).finished.catch(() => {});
+      await sleep(60);
+    }
+  };
+  const fit = (bb, box) => { const s = Math.min(box.w / bb.w, box.h / bb.h); return { s, tx: box.cx - s * bb.cx, ty: box.cy - s * bb.cy }; };
+  const tf = ({ s, tx, ty }) => `translate(${tx}px, ${ty}px) scale(${s})`;
+  const move = (g, from, ms = 750) => g.animate([{ transform: tf(from) }, { transform: 'translate(0px, 0px) scale(1)' }], { duration: ms, easing: 'cubic-bezier(.5,0,.2,1)', fill: 'forwards' }).finished.catch(() => {});
+  const bbOf = (c, idx) => { const r = refOf(c); return bbox((idx || r.map((_, i) => i)).map(i => r[i].pts)); };
+  const say = t => { if (alive()) cap.innerHTML = t; };
+  const L = lessonOf(ch);
+  svg.innerHTML = ''; say('&nbsp;');
+  if (L.chain && L.chain.length > 1) {
+    let prev = L.chain[0];
+    say(`<span class="jp">${prev}</span> — ${esc(lessonOf(prev).ru || '')}`);
+    await draw(strokesG(prev, null, INK)); await sleep(700);
+    for (const next of L.chain.slice(1)) {
+      if (!alive()) return;
+      const prevBox = bbOf(prev); svg.innerHTML = '';
+      const parts = lessonOf(next).parts || []; let moved = false;
+      for (const pt of parts) {
+        if (!alive()) return;
+        const g = strokesG(next, pt.s, INK);
+        if (pt.label === prev && !moved) { moved = true; say(`<span class="jp">${prev}</span> отходит в сторону…`); await move(g, fit(bbOf(next, pt.s), prevBox)); }
+        else { g.querySelectorAll('path').forEach(p => { const l = p.getTotalLength(); p.style.strokeDasharray = `${l} ${l}`; p.style.strokeDashoffset = l; });
+          say(esc(pt.note || pt.label)); await draw(g, 12); }
+        await sleep(250);
+      }
+      say(`<span class="jp">${next}</span> — ${esc(lessonOf(next).ru || '')}`); await sleep(900); prev = next;
+    }
+    return;
+  }
+  if (L.parts && L.parts.length) {
+    const box = { cx: 54.5, cy: 54.5, w: 70, h: 70 };
+    for (const [k, pt] of L.parts.entries()) {
+      if (!alive()) return;
+      const col = ['#c8346a', '#2f6f95', '#5d7f1e', '#b5762b'][k % 4];
+      const g = strokesG(ch, pt.s, col);
+      g.style.transform = tf(fit(bbOf(ch, pt.s), box));
+      g.querySelectorAll('path').forEach(p => { const l = p.getTotalLength(); p.style.strokeDasharray = `${l} ${l}`; p.style.strokeDashoffset = l; });
+      say(`${pt.label ? `<span class="jp">${pt.label}</span> — ` : ''}${esc(pt.note || '')}`);
+      await draw(g, 11); await sleep(500);
+      await move(g, fit(bbOf(ch, pt.s), box)); g.style.transform = ''; await sleep(300);
+    }
+    await sleep(300);
+    svg.querySelectorAll('g').forEach(g => g.animate([{ stroke: g.getAttribute('stroke') }, { stroke: INK }], { duration: 600, fill: 'forwards' }));
+    say(`<span class="jp">${ch}</span> — ${esc(L.ru || '')}`);
+    return;
+  }
+  const g = strokesG(ch, null, INK);
+  g.querySelectorAll('path').forEach(p => { const l = p.getTotalLength(); p.style.strokeDasharray = `${l} ${l}`; p.style.strokeDashoffset = l; });
+  say('Порядок черт'); await draw(g, 11);
+  say(`<span class="jp">${ch}</span> — ${esc(L.ru || '')}`);
+}
+
 /* ===================== НАСТРОЙКИ ===================== */
 function renderSettings() {
   const s = S.settings;
@@ -757,11 +1003,12 @@ function renderSettings() {
   app().innerHTML = `
   <header class="top"><button class="icon-btn" data-go="home">${ICON.back}</button><h1>Настройки</h1></header>
   <div class="card set-item"><h3>Строгость проверки</h3><p>Насколько точно черта должна совпасть с образцом. Порядок и направление проверяются всегда.</p>${seg('strict', [['lenient', 'Мягко'], ['normal', 'Обычно'], ['strict', 'Строго']], s.strict)}</div>
+  <div class="card set-item"><h3>書 Режим каллиграфа</h3><p>Черта сравнивается как есть — с дрожью руки и хвостиками касания стилуса. Без режима дрожь сглаживается, а хвостики срезаются. «Авто» включает его только для Apple Pencil: пальцем каждый может.</p>${seg('calli', [['auto', 'Авто · Pencil'], ['on', 'Всегда'], ['off', 'Выключен']], s.calli)}</div>
   <div class="card set-item"><h3>Вспышка</h3><p>Сколько секунд образец виден на уровне ③.</p>${seg('flash', [[1500, '1,5 с'], [2500, '2,5 с'], [3500, '3,5 с']], s.flash)}</div>
   <div class="card set-item"><h3>Озвучка</h3><p>Японский голос iOS произносит знак. Если молчит — добавь голос в Настройки → Универсальный доступ → Устный контент.</p>${seg('sound', [[true, 'Включена'], [false, 'Выключена']], s.sound)}</div>
   <div class="card set-item"><h3>Резервная копия</h3><p>Прогресс живёт в памяти браузера на этом устройстве. Сохрани файл, чтобы перенести на второй iPad или не потерять.</p>
     <div class="btns"><button class="btn" id="exp">Сохранить файл</button><label class="btn">Загрузить<input type="file" id="imp" accept="application/json,.json" hidden></label><button class="btn ghost" id="reset">Сбросить всё</button></div></div>
-  <div class="credits">Данные о чертах: <a href="https://kanjivg.tagaini.net" target="_blank" rel="noopener">KanjiVG</a> © Ulrich Apel, лицензия CC BY-SA 3.0. Ромадзи — система Хэпбёрна.</div>`;
+  <div class="credits">Данные о чертах и составе знаков: <a href="https://kanjivg.tagaini.net" target="_blank" rel="noopener">KanjiVG</a> © Ulrich Apel, лицензия CC BY-SA 3.0. Ромадзи — система Хэпбёрна. Истории кота — художественные; честная версия всегда под ними.</div>`;
   bindNav();
   $$('[data-k]').forEach(b => b.addEventListener('click', () => {
     let v = b.dataset.v; if (b.dataset.k === 'flash') v = +v; if (b.dataset.k === 'sound') v = v === 'true';
@@ -790,12 +1037,13 @@ function renderSettings() {
 
 /* ===================== СТАРТ ===================== */
 async function boot() {
-  const [kana, cat] = await Promise.all([fetch('data/kana.json').then(r => r.json()), fetch('img/cat.svg').then(r => r.text())]);
-  KANA = kana; CAT_SVG = cat;
+  const [kana, kanji, cat] = await Promise.all([fetch('data/kana.json').then(r => r.json()), fetch('data/kanji.json').then(r => r.json()), fetch('img/cat.svg').then(r => r.text())]);
+  KANA = kana; KANJI = kanji; CAT_SVG = cat;
+  if (window.KANJI_LESSONS) LESSONS = window.KANJI_LESSONS;
   go('home');
   if ('serviceWorker' in navigator && location.protocol === 'https:') { try { navigator.serviceWorker.register('sw.js'); } catch (e) {} }
 }
 // для тестов
-window.NK = { refOf, checkLive, checkWhole, strokeMatch, normalize, TOL, get KANA() { return KANA; }, S: () => S, go, toKata, ROWS, DROWS };
+window.NK = { refOf, checkLive, checkWhole, strokeMatch, normalize, TOL, get KANA() { return KANA; }, get KANJI() { return KANJI; }, get LESSONS() { return LESSONS; }, setCalli: v => { CALLI = v; }, clean, S: () => S, go, toKata, ROWS, DROWS, openExplain };
 boot().catch(err => { app().innerHTML = `<div class="boot" style="font-size:20px;font-family:var(--serif)">Не удалось загрузить данные: ${esc(err.message || err)}</div>`; });
 })();
